@@ -28,7 +28,8 @@ class RayA2AAgentActor:
     def __init__(self, metadata: dict = None):
         self.metadata = metadata or {}
         # Persistent client prevents repeated connection/allocation overhead
-        self.client = httpx.Client(timeout=120.0)
+        timeout = httpx.Timeout(120.0, connect=60.0)
+        self.client = httpx.Client(timeout=timeout)
         print(f"[*] Initialized Distributed Agent Actor instance with metadata: {self.metadata}")
 
     def post_task(self, target_url: str, text_payload: str) -> dict:

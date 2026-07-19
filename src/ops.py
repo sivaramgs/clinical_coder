@@ -28,19 +28,30 @@ class LLMGuardrails:
         before sending data to any local LLM or Actor node.
         """
         original_text = text
+        # 1. Names with Titles
+        # Updated regex to handle both "Mr. Name" and "Mr.Name"
+        text = re.sub(r'\b(?:Mr\.|Mrs\.|Ms\.|Dr\.|Patient)\s*[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?\b', '[REDACTED NAME]', text)
 
-        # 1. Singapore NRIC/FIN (e.g., S1234567A, G7654321Z, T0123456H)
+        # 2. General Phone Numbers (Matches standard 10-digit and international formats)
+        # e.g., (123) 456-7890, 123-456-7890, +1 123 456 7890
+        text = re.sub(r'(?:\+?\d{1,3}[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}', '[REDACTED PHONE]', text)
+
+        # 3. Singapore NRIC/FIN (e.g., S1234567A, G7654321Z)
         text = re.sub(r'[STFGM]\d{7}[A-Z]', '[REDACTED NRIC]', text, flags=re.IGNORECASE)
 
-        # 2. Singapore Phone Numbers (e.g., +65 8123 4567, 91234567)
+        # 4. Singapore Mobile Numbers (e.g., +65 8123 4567)
         text = re.sub(r'(?:\+65[\s-]?)?[89]\d{3}[\s-]?\d{4}', '[REDACTED PHONE]', text)
 
-        # 3. Common SG Hospital MRN formats (Often 7-8 alphanumeric chars like MRN: A1234567)
+        # 5. Common Hospital MRN formats (MRN: A1234567)
         text = re.sub(r'\b(?:MRN|UHID)[\s:]*[A-Z0-9]{6,10}\b', '[REDACTED MRN]', text, flags=re.IGNORECASE)
 
-        if text != original_text:
-            GUARDRAIL_INTERCEPTIONS.inc()
+        # 6. Email Addresses (Matches standard user@domain.com formats)
+        text = re.sub(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b', '[REDACTED EMAIL]', text)
 
+        if text != original_text:
+            # Increment prometheus counter if redactions occurred
+            GUARDRAIL_INTERCEPTIONS.inc()
+            
         return text
 
 # --- METRIC EVALUATIONS ---

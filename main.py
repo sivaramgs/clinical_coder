@@ -73,19 +73,66 @@ def assistant_logic(payload: A2APayload):
 
 
 # --- Coder Node App Routes ---
+import json
+
 @coder_app.post("/a2a/execute")
 def coder_logic(payload: A2APayload):
     """
-    Embeds the extracted clinical terms and performs a vector search against
-    the ICD-10-CM collection. Returns a modest top-5 candidate set directly —
-    no reranking step (removed along with the CrossEncoder dependency).
+    Parses structured JSON from the Assistant Node, generates independent embeddings 
+    for each clinical entity to prevent vector dilution, and safely aggregates a broader 
+    candidate set for the final reasoning model.
     """
-    terms = payload.input_data
-    vector = inference_gateway.generate_local_embedding(terms)
-    references = db.search_similar_codes(query_vector=vector, limit=5)
-    return {"query_terms": terms, "references": references}
+    raw_text = payload.input_data
+    aggregated_references = []
+    search_queries = []
+    
+    # 1. Parse out separate entities to prevent vector dilution
+    try:
+        extracted_entities = json.loads(raw_text)
+        if isinstance(extracted_entities, dict):
+            for category in ["diagnoses", "history_and_risk_factors", "external_causes"]:
+                if category in extracted_entities and isinstance(extracted_entities[category], list):
+                    # Clean up entries and drop empty values
+                    search_queries.extend([str(item).strip() for item in extracted_entities[category] if item])
+    except (json.JSONDecodeError, TypeError):
+        # Fallback if Assistant returned plain unstructured text or malformed payload
+        search_queries = []
 
+    # If parsing yielded no distinct strings, fall back to the raw block
+    if not search_queries:
+        search_queries = [raw_text]
 
+    # 2. Batch embedding retrieval via gateway client
+    vectors = inference_gateway.generate_local_embeddings_batch(search_queries)
+    
+    # 3. Query vector DB independently for higher recall
+    for vec in vectors:
+        matches = db.search_similar_codes(query_vector=vec, limit=10)
+        if matches:
+            aggregated_references.extend(matches)
+        
+    # 4. Crash-Resilient Deduplication (Handles both strings and dictionaries)
+    unique_references = []
+    seen = set()
+    
+    for ref in aggregated_references:
+        # If references are dictionaries, unique-check them by stringifying or matching a key
+        if isinstance(ref, dict):
+            # Fallback to key 'code' if available, otherwise serialize to string
+            fingerprint = ref.get("code") or json.dumps(ref, sort_keys=True)
+            if fingerprint not in seen:
+                seen.add(fingerprint)
+                unique_references.append(ref)
+        else:
+            # If references are flat strings
+            if ref not in seen:
+                seen.add(ref)
+                unique_references.append(ref)
+    
+    return {
+        "query_terms": raw_text, 
+        "references": unique_references
+    }
 # =========================================================================
 # 4. MASTER PORTAL HUB ENDPOINTS
 # =========================================================================
@@ -153,13 +200,19 @@ async def process(payload: InputData):
         # Phase 3: Final LLM mapping via SEA-LION, using the top-5 vector
         # search candidates directly as context (no reranking step).
         mapping_prompt = (
-            f"Given the following clinical terms: {query_terms}\n\n"
-            f"And these candidate ICD-10-CM codes: {candidates}\n\n"
-            "Return ONLY the single best-matching ICD-10-CM code, or a "
-            "comma-separated list if multiple clearly apply, in strict "
-            "ICD-10-CM format (e.g. E11.9). Do not include any explanation, "
-            "reasoning, or additional text."
-        )
+            f"You are a Professional Medical Coder executing complete multi-axial ICD-10-CM assignment.\n\n"
+            f"INPUT DATA SCHEMA:\n"
+            f"Extracted Entities: {query_terms}\n"
+            f"Candidate Reference Codes from Vector Database: {candidates}\n\n"
+            f"TASK CRITERIA:\n"
+            f"1. Evaluate the clinical 'diagnoses' against candidates to assign primary/secondary disease codes .\n"
+            f"2. Evaluate 'history_and_risk_factors' against candidates to assign supplementary status codes.\n"
+            f"3. Evaluate 'external_causes' against candidates to assign environmental mechanism codes.\n\n"
+            f"OUTPUT FORMAT:\n"
+            f"Return ONLY a comma-separated list of all applicable valid codes in strict ICD-10-CM format. "
+            f"Do not include explanation, introductory text, or Markdown formatting blocks."
+            )
+
         mapping_res, engine = llm_router.route_query(
             mapping_prompt, "You are a Professional Medical Coder.", "mapping"
         )
