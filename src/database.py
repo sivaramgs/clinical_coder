@@ -56,7 +56,7 @@ class LocalVectorDB:
         )
         print("[*] Ingestion complete.")
 
-    def search_similar_codes(self, query_vector: list[float], limit: int = 15) -> list[dict]:
+    def search_similar_codes(self, query_vector: list[float], limit: int = 10) -> list[dict]:
         """Performs a similarity search against stored ICD-10 vectors."""
         try:
             hits = self.client.search(

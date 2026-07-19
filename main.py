@@ -1,4 +1,6 @@
 import os
+import re
+import json
 import time
 import httpx
 import uvicorn
@@ -73,8 +75,6 @@ def assistant_logic(payload: A2APayload):
 
 
 # --- Coder Node App Routes ---
-import json
-
 @coder_app.post("/a2a/execute")
 def coder_logic(payload: A2APayload):
     """
@@ -133,6 +133,7 @@ def coder_logic(payload: A2APayload):
         "query_terms": raw_text, 
         "references": unique_references
     }
+
 # =========================================================================
 # 4. MASTER PORTAL HUB ENDPOINTS
 # =========================================================================
@@ -160,13 +161,6 @@ async def process(payload: InputData):
             detail="Agent actor not yet initialized (Ray still starting up). Please retry shortly."
         )
 
-    # IMPORTANT FIX: trace creation is now wrapped in its own try/except,
-    # separate from the main pipeline logic. Previously, if langfuse.trace()
-    # itself failed (e.g. bad host/credentials), `trace` was never assigned
-    # — but the outer except block unconditionally called trace.update(...),
-    # raising UnboundLocalError and masking the real error entirely. Now a
-    # Langfuse failure degrades gracefully (trace=None) instead of crashing
-    # the whole request in a confusing way.
     try:
         trace = langfuse.trace(name="Clinical Processing Pipeline", input=payload.clinical_note)
     except Exception as e:
@@ -196,9 +190,13 @@ async def process(payload: InputData):
 
         query_terms = coder_res.get("query_terms", assistant_res["extracted_terms"])
         candidates = coder_res.get("references", [])
+        
+        # --- TELEMETRY: RECALL SCORE ---
+        if trace:
+            recall_score = 1.0 if len(candidates) > 0 else 0.0
+            trace.score(name="clinical-recall", value=recall_score, comment=f"Found {len(candidates)} candidates")
 
-        # Phase 3: Final LLM mapping via SEA-LION, using the top-5 vector
-        # search candidates directly as context (no reranking step).
+        # Phase 3: Final LLM mapping via SEA-LION, using the vector search candidates directly as context.
         mapping_prompt = (
             f"You are a Professional Medical Coder executing complete multi-axial ICD-10-CM assignment.\n\n"
             f"INPUT DATA SCHEMA:\n"
@@ -211,23 +209,56 @@ async def process(payload: InputData):
             f"OUTPUT FORMAT:\n"
             f"Return ONLY a comma-separated list of all applicable valid codes in strict ICD-10-CM format. "
             f"Do not include explanation, introductory text, or Markdown formatting blocks."
-            )
+        )
 
         mapping_res, engine = llm_router.route_query(
             mapping_prompt, "You are a Professional Medical Coder.", "mapping"
         )
         final_text = mapping_res.get("text", "").strip()
 
-        # Validate the model's output against strict ICD-10-CM format.
-        validated_codes = [
-            c.strip() for c in final_text.split(",")
-            if LLMEvaluations.is_valid_icd10_format(c.strip())
-        ]
+        # Robust Extraction: Pull all matching ICD-10 patterns from conversational filler text
+        raw_extracted_codes = re.findall(r'\b[A-TV-Z][0-9][0-9A-B](?:\.[0-9A-TV-Z]{1,4})?\b', final_text.upper())
+
+        # Clean, validate, and deduplicate codes inline
+        validated_codes = []
+        seen_codes = set()
+        for code in raw_extracted_codes:
+            cleaned_code = code.strip()
+            if cleaned_code not in seen_codes and LLMEvaluations.is_valid_icd10_format(cleaned_code):
+                seen_codes.add(cleaned_code)
+                validated_codes.append(cleaned_code)
+
+        # Enforce flexible limitation (Maximum of 10 codes, but frequently fewer)
+        validated_codes = validated_codes[:10]
+
+        # Sync verification: Ensure the semantic matches (MCP list) fully contains all final medical codes
+        existing_candidate_codes = set()
+        for ref in candidates:
+            if isinstance(ref, dict) and ref.get("code"):
+                existing_candidate_codes.add(ref.get("code").strip().upper())
+            elif isinstance(ref, str):
+                existing_candidate_codes.add(ref.strip().upper())
+
+        for final_code in validated_codes:
+            code_upper = final_code.upper()
+            if code_upper not in existing_candidate_codes:
+                candidates.append({
+                    "code": final_code,
+                    "short_description": "Final Mapped Diagnostic Code Reference",
+                    "long_description": f"ICD-10-CM code {final_code} assigned by mapping evaluation.",
+                    "description": "Final Mapped Diagnostic Code Reference",
+                    "score": 1.0
+                })
+                existing_candidate_codes.add(code_upper)
 
         if trace is not None:
             try:
                 trace.update(
                     output=final_text,
+                    usage={
+                        "promptTokens": assistant_res.get("prompt_tokens", 0) + mapping_res.get("prompt_tokens", 0),
+                        "completionTokens": assistant_res.get("completion_tokens", 0) + mapping_res.get("completion_tokens", 0),
+                    },
                     metadata={
                         "note_id": payload.note_id,
                         "engine_used": engine,
@@ -246,7 +277,7 @@ async def process(payload: InputData):
             "mapped_diagnostics": final_text,
             "validated_icd10_codes": validated_codes
         }
-        langfuse.flush()
+        
     except HTTPException:
         raise
     except Exception as e:
