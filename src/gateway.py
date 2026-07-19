@@ -14,9 +14,10 @@ class ClinicalInferenceGateway:
         self.ollama_host = os.getenv("OLLAMA_HOST", config.OLLAMA_HOST)
         self.api_key = os.getenv("OLLAMA_API_KEY", config.OLLAMA_API_KEY)
 
+        # Timeout extended to 300.0s to allow local Ollama instances ample time to warm up
         self.gateway_client = httpx.Client(
             base_url=self.ollama_host,
-            timeout=120.0,
+            timeout=300.0,
             headers={"Authorization": f"Bearer {self.api_key}"}
         )
 
@@ -34,7 +35,7 @@ class ClinicalInferenceGateway:
             "input": text
         }
         try:
-            response = self.gateway_client.post("/api/embed", json=payload, timeout=120.0)
+            response = self.gateway_client.post("/api/embed", json=payload, timeout=300.0)
             response.raise_for_status()
 
             vectors = response.json().get("embeddings", [])
@@ -52,7 +53,7 @@ class ClinicalInferenceGateway:
             "input": texts
         }
         try:
-            response = self.gateway_client.post("/api/embed", json=payload, timeout=120.0)
+            response = self.gateway_client.post("/api/embed", json=payload, timeout=300.0)
             response.raise_for_status()
             vectors = response.json().get("embeddings", [])
 
@@ -97,13 +98,6 @@ class ClinicalInferenceGateway:
 
         response = self.gateway_client.post("/api/chat", json=payload)
 
-        # IMPORTANT: don't use response.raise_for_status() here — it raises
-        # httpx.HTTPStatusError with only the generic "400 Bad Request"
-        # message and discards Ollama's actual response body, which is
-        # where the real reason lives (e.g. context length exceeded,
-        # malformed field, model-specific rejection). Capturing response
-        # body text on failure is the difference between a diagnosable
-        # error and "All sovereign routing paths exhausted" with no detail.
         if response.status_code >= 400:
             raise RuntimeError(
                 f"Ollama /api/chat returned {response.status_code} for model '{model_name}': "
@@ -125,19 +119,7 @@ class LLMGatewayRouter:
     Thin routing layer on top of ClinicalInferenceGateway: picks which local
     model handles a task, then delegates the actual call to the gateway's
     /api/chat path.
-
-    IMPORTANT: this class previously built its own raw prompt using manually
-    inserted Llama-3 special tokens (<|begin_of_text|>, etc.) and sent it to
-    Ollama's /api/generate endpoint WITHOUT "raw": true. Ollama applies the
-    target model's chat template automatically by default — so that
-    hand-formatted prompt was being template-wrapped a SECOND time on top,
-    corrupting the special tokens and producing malformed/inconsistent
-    output. This was the direct cause of A2A responses not matching expected
-    results. Delegating to ClinicalInferenceGateway's /api/chat (which lets
-    Ollama apply its own template exactly once, correctly) fixes this, and
-    also gains automatic model fallback on failure for free.
     """
-
     def __init__(self, gateway_instance: "ClinicalInferenceGateway"):
         if gateway_instance is None:
             raise ValueError(
@@ -149,11 +131,6 @@ class LLMGatewayRouter:
         self.model_sealion = self.gw.reasoning_model_name
 
     def route_query(self, prompt: str, system_prompt: str, task_type: str) -> Tuple[Dict[str, Any], str]:
-        """
-        Routes task execution to the appropriate local model:
-        - mapping / extraction / reasoning tasks -> SEA-LION
-        - everything else (e.g. conversational) -> MERaLiON
-        """
         if task_type in ["mapping", "extraction", "reasoning"]:
             target = self.model_sealion
         else:
