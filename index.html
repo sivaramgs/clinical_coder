@@ -18,19 +18,19 @@
 </head>
 <body>
     <div class="container">
-        <h1>🇸🇬 Clinical Core Portal</h1>
-        <p>Analyze clinical notes with real-time NRIC/PII scrubbing, local sentence-transformers embedding matching, and local Llama-SEA-LION inference.</p>
+        <h1>🇸🇬 Clinical Coder</h1>
+        <p>Analyze clinical notes with thousands of lines of clinical documentation and returns accurate, audit-ready medical codes.</p>
         
         <div class="label">Patient Clinical Note Entry</div>
         <textarea id="noteInput" placeholder="Enter clinical text here... e.g., Patient S9123456A presented with severe low back pain for 3 days."></textarea>
         <button onclick="processNote()">Execute Secure Pipeline</button>
 
         <div class="results" id="resultsBlock">
-            <h2>Pipeline Execution Trace</h2>
-            <div class="label">Sanitized Note (A2A Assistant Node)</div>
+            <h2>Pipeline Execution</h2>
+            <div class="label">Sanitized Note</div>
             <div class="box" id="sanitizedBox"></div>
 
-            <div class="label">Semantic Vector Matches (MCP Qdrant Tool)</div>
+            <div class="label">Semantic Matches</div>
             <div class="box" id="mcpBox"></div>
 
             <div class="label">Final ICD-10-CM Code(s)</div>

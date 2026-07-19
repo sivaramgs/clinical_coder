@@ -218,8 +218,7 @@ __marimo__/
 .streamlit/secrets.toml
 
 
-# Local data 
-data/
+.vscode/
 
 *.pyc
 .DS_Store
