@@ -1,9 +1,9 @@
 import ray
 import httpx
-from src.ops import  LLMGuardrails
+from src.ops import LLMGuardrails
 
 
-@ray.remote
+@ray.remote(num_cpus=0.5, memory=512 * 1024 * 1024)
 class RayA2AAgentActor:
     """
     Ray remote actor executing out-of-process A2A pipeline tasks.
@@ -15,6 +15,14 @@ class RayA2AAgentActor:
     dying outright on first use. Removed per request: keep this pipeline
     to the sovereign local Ollama models (MERaLiON / SEA-LION) only, no
     external model downloads.
+
+    UPDATE: reduced the resource reservation from num_cpus=4 / 1GB down to
+    num_cpus=0.5 / 512MB. This actor only holds a single httpx.Client and
+    does I/O-bound HTTP calls — it never needed 4 dedicated CPU cores.
+    Over-reserving resources doesn't itself cause an OOM kill, but combined
+    with the ollama/Ray memory-monitor settings that were disabled
+    elsewhere in this stack, it added unnecessary scheduling pressure on a
+    system already under memory strain from multiple large loaded models.
     """
 
     def __init__(self, metadata: dict = None):

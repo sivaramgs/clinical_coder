@@ -33,11 +33,8 @@
             <div class="label">Semantic Vector Matches (MCP Qdrant Tool)</div>
             <div class="box" id="mcpBox"></div>
 
-            <div class="label">Audited Code Maps (A2A Coder Specialist Node)</div>
-            <div class="box" id="coderBox"></div>
-
-            <div class="label">Validated ICD-10-CM Codes</div>
-            <div class="box" id="validatedBox"></div>
+            <div class="label">Final ICD-10-CM Code(s)</div>
+            <div class="box" id="finalCodesBox"></div>
         </div>
     </div>
 
@@ -60,11 +57,11 @@
                 
                 document.getElementById('sanitizedBox').innerText = data.sanitized_note;
                 document.getElementById('mcpBox').innerText = JSON.stringify(data.mcp_vector_matches, null, 2);
-                document.getElementById('coderBox').innerText = data.mapped_diagnostics;
 
                 const validated = data.validated_icd10_codes || [];
-                document.getElementById('validatedBox').innerText =
-                    validated.length ? validated.join(', ') : '(no codes passed strict ICD-10-CM format validation)';
+                document.getElementById('finalCodesBox').innerText = validated.length
+                    ? validated.join(', ')
+                    : `(no codes passed strict ICD-10-CM format validation — raw model output: ${data.mapped_diagnostics})`;
 
                 document.getElementById('resultsBlock').style.display = 'block';
             } catch(e) {

@@ -92,11 +92,24 @@ class ClinicalInferenceGateway:
                 {"role": "user", "content": prompt}
             ],
             "stream": False,
-            "options": {"temperature": 0.0}  # Enforce strict zero-temperature mapping
+            "options": {"temperature": 0.0, "num_ctx": 8192}
         }
 
         response = self.gateway_client.post("/api/chat", json=payload)
-        response.raise_for_status()
+
+        # IMPORTANT: don't use response.raise_for_status() here — it raises
+        # httpx.HTTPStatusError with only the generic "400 Bad Request"
+        # message and discards Ollama's actual response body, which is
+        # where the real reason lives (e.g. context length exceeded,
+        # malformed field, model-specific rejection). Capturing response
+        # body text on failure is the difference between a diagnosable
+        # error and "All sovereign routing paths exhausted" with no detail.
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"Ollama /api/chat returned {response.status_code} for model '{model_name}': "
+                f"{response.text[:2000]}"
+            )
+
         body = response.json()
 
         return {

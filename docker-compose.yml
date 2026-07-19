@@ -4,11 +4,17 @@ networks:
 
 volumes:
   qdrant_storage:
-  postgres_data:
-  clickhouse_data:
-  redis_data:
-  minio_data:
   ollama_storage:
+  langfuse_postgres_data:
+    driver: local
+  langfuse_clickhouse_data:
+    driver: local
+  langfuse_clickhouse_logs:
+    driver: local
+  langfuse_minio_data:
+    driver: local
+  langfuse_redis_data:
+    driver: local
 
 services:
   # =========================================================================
@@ -22,30 +28,34 @@ services:
     volumes: [ollama_storage:/root/.ollama]
     environment:
       - OLLAMA_HOST=0.0.0.0
-      - OLLAMA_NUM_PARALLEL=2
+      - OLLAMA_NUM_PARALLEL=1
       - OLLAMA_MAX_LOADED_MODELS=1
-      - OLLAMA_KEEP_ALIVE=5m
+      - OLLAMA_KEEP_ALIVE=30s
     networks: [clinical-net]
-    deploy:
-      resources:
-        limits:
-          memory: 8G
+    deploy: {resources: {limits: {memory: 8G}}}
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
         ollama serve & SERVE_PID=$$!
         until ollama list >/dev/null 2>&1; do sleep 2; done
         MODELS="nomic-embed-text aisingapore/Llama-SEA-LION-v3.5-8B-R u1i/LLaMA-3-MERaLiON-8B-Instruct:q4k"
-        CURRENT=$$(ollama list | tail -n +2 | awk '{print $$1}')
-        for m in $$MODELS; do
-          if ! echo "$$CURRENT" | grep -q "$${m%:*}/"; then ollama pull "$$m"; fi
-        done
+        for m in $$MODELS; do ollama pull "$$m"; done
         wait $$SERVE_PID
     healthcheck:
-      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1"]
+      # IMPORTANT: the previous healthcheck only ran `ollama list`, which
+      # succeeds as soon as the bare server process responds — long before
+      # the model-pull loop above has actually finished downloading
+      # nomic-embed-text or SEA-LION. Docker marked the container "healthy"
+      # immediately, so data-ingest (which only waits on
+      # condition: service_healthy) started hitting /api/embed with a
+      # model that didn't exist on the server yet, causing a 404 on every
+      # single embedding call. This checks that BOTH required models are
+      # actually present before reporting healthy.
+      test: ["CMD-SHELL", "ollama list 2>/dev/null | grep -q 'nomic-embed-text' && ollama list 2>/dev/null | grep -q 'Llama-SEA-LION' && ollama list 2>/dev/null | grep -q 'MERaLiON'"]
       interval: 5s
-      timeout: 3s
-      retries: 20
+      timeout: 5s
+      retries: 180
+      start_period: 15s
 
   data-ingest:
     image: python:3.12-slim
@@ -54,22 +64,14 @@ services:
     working_dir: /app
     environment:
       - OLLAMA_HOST=http://local-ollama-engine:11434
-      - QDRANT_URL=http://local-qdrant-db:6333
-      - QDRANT_API_KEY=sk-qdrant-secure-key-12345
-      - FORCE_REINGEST=false
     networks: [clinical-net]
     command: >
       sh -c "pip install --no-cache-dir uv && uv sync && uv run python -m src.ingest"
     depends_on:
       ollama: {condition: service_healthy}
-      local-qdrant-db: {condition: service_started}
 
   # =========================================================================
   # CORE WEB GATEWAY PORTAL
-  # Published directly on 8000 — the previous nginx-gateway reverse-proxy
-  # layer was removed from this version of the stack, which left NOTHING
-  # publishing a port to the host. `expose` only makes a port reachable
-  # container-to-container, never from your browser/host machine.
   # =========================================================================
   clinical-coder-api:
     image: python:3.12-slim
@@ -84,20 +86,16 @@ services:
       - OLLAMA_API_KEY=sk-ollama-secure-key-12345
       - QDRANT_URL=http://local-qdrant-db:6333
       - QDRANT_API_KEY=sk-qdrant-secure-key-12345
-      - LANGFUSE_HOST=http://clinical-langfuse-web:3000
-      - LANGFUSE_PUBLIC_KEY=pk-lf-mock
-      - LANGFUSE_SECRET_KEY=sk-lf-mock
-      # Explicit container-to-container URLs. Without these, main.py's
-      # ASSISTANT_AGENT_URL/CODER_AGENT_URL default to 127.0.0.1, which
-      # silently triggers its "local dev fallback" mode — spinning up
-      # embedded agent servers INSIDE this container instead of routing
-      # to the actual dedicated clinical-assistant-agent /
-      # clinical-coder-agent containers you're running.
+      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY}
+      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY}
+      - LANGFUSE_BASE_URL=http://langfuse-web:3000
+      - RAY_OBJECT_STORE_ALLOW_SLOW_STORAGE=1
+      - RAY_memory_usage_threshold=0.90
+      - RAY_idle_worker_killing_memory_threshold_bytes=104857600
+      - RAY_worker_max_restarts=1
+      - RAY_memory_monitor_refresh_ms=250
       - ASSISTANT_AGENT_URL=http://clinical-assistant-agent:8003
       - CODER_AGENT_URL=http://clinical-coder-agent:8004
-      - RAY_memory_monitor_refresh_ms=0
-      - RAY_memory_usage_threshold=1.0
-      - RAY_OBJECT_STORE_ALLOW_SLOW_STORAGE=1
     networks: [clinical-net]
     depends_on:
       data-ingest: {condition: service_completed_successfully}
@@ -114,9 +112,14 @@ services:
     environment:
       - OLLAMA_HOST=http://local-ollama-engine:11434
       - OLLAMA_API_KEY=sk-ollama-secure-key-12345
-      - RAY_memory_monitor_refresh_ms=0
-      - RAY_memory_usage_threshold=1.0
+      - RAY_OBJECT_STORE_ALLOW_SLOW_STORAGE=1
+      - RAY_memory_usage_threshold=0.90
+      - RAY_idle_worker_killing_memory_threshold_bytes=104857600
+      - RAY_worker_max_restarts=1
+      - RAY_memory_monitor_refresh_ms=250
     networks: [clinical-net]
+    depends_on:
+      data-ingest: {condition: service_completed_successfully}
     command: >
       sh -c "pip install --no-cache-dir uv && uv pip install --system -r requirements.txt && uvicorn main:assistant_app --host 0.0.0.0 --port 8003"
 
@@ -132,13 +135,18 @@ services:
       - OLLAMA_API_KEY=sk-ollama-secure-key-12345
       - QDRANT_URL=http://local-qdrant-db:6333
       - QDRANT_API_KEY=sk-qdrant-secure-key-12345
-      - RAY_memory_monitor_refresh_ms=0
-      - RAY_memory_usage_threshold=1.0
+      - RAY_OBJECT_STORE_ALLOW_SLOW_STORAGE=1
+      - RAY_memory_usage_threshold=0.90
+      - RAY_idle_worker_killing_memory_threshold_bytes=104857600
+      - RAY_worker_max_restarts=1
+      - RAY_memory_monitor_refresh_ms=250
     networks: [clinical-net]
+    depends_on:
+      data-ingest: {condition: service_completed_successfully}
     command: >
       sh -c "pip install --no-cache-dir uv && uv pip install --system -r requirements.txt && uvicorn main:coder_app --host 0.0.0.0 --port 8004"
 
-  # Databases & Telemetry with strict memory limits
+# Databases & Telemetry
   local-qdrant-db:
     image: qdrant/qdrant:latest
     container_name: local-qdrant-db
@@ -146,89 +154,171 @@ services:
     ports: ["6333:6333"]
     volumes: [qdrant_storage:/qdrant/storage]
     networks: [clinical-net]
-    deploy: {resources: {limits: {memory: 512M}}}
 
-  langfuse-postgres:
-    image: postgres:16-alpine
-    container_name: langfuse-postgres
+  langfuse-worker:
+    image: docker.io/langfuse/langfuse-worker:3
     restart: always
-    environment: [POSTGRES_USER=postgres, POSTGRES_PASSWORD=local_secure_password, POSTGRES_DB=langfuse]
-    expose: ["5432"]
-    volumes: [postgres_data:/var/lib/postgresql/data]
+    depends_on: &langfuse-depends-on
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    ports:
+      - 3030:3030
     networks: [clinical-net]
-    deploy: {resources: {limits: {memory: 512M}}}
-    healthcheck: {test: ["CMD-SHELL", "pg_isready -U postgres"], interval: 5s, retries: 5}
+    environment: &langfuse-worker-env
+      NEXTAUTH_URL: ${NEXTAUTH_URL:-http://localhost:3000}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://postgres:postgres@postgres:5432/postgres} # CHANGEME
+      SALT: ${SALT:-mysalt} # CHANGEME
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-0000000000000000000000000000000000000000000000000000000000000000} # CHANGEME: generate via `openssl rand -hex 32`
+      TELEMETRY_ENABLED: ${TELEMETRY_ENABLED:-true}
+      LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: ${LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES:-false}
+      CLICKHOUSE_MIGRATION_URL: ${CLICKHOUSE_MIGRATION_URL:-clickhouse://clickhouse:9000}
+      CLICKHOUSE_URL: ${CLICKHOUSE_URL:-http://clickhouse:8123}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse} # CHANGEME
+      CLICKHOUSE_CLUSTER_ENABLED: ${CLICKHOUSE_CLUSTER_ENABLED:-false}
+      LANGFUSE_USE_AZURE_BLOB: ${LANGFUSE_USE_AZURE_BLOB:-false}
+      LANGFUSE_USE_OCI_NATIVE_OBJECT_STORAGE: ${LANGFUSE_USE_OCI_NATIVE_OBJECT_STORAGE:-false}
+      LANGFUSE_OCI_AUTH_TYPE: ${LANGFUSE_OCI_AUTH_TYPE:-workload_identity}
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: ${LANGFUSE_S3_EVENT_UPLOAD_BUCKET:-langfuse}
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: ${LANGFUSE_S3_EVENT_UPLOAD_REGION:-auto}
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: ${LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID:-minio}
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY:-miniosecret} # CHANGEME
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: ${LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT:-http://minio:9000}
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: ${LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE:-true}
+      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: ${LANGFUSE_S3_EVENT_UPLOAD_PREFIX:-events/}
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: ${LANGFUSE_S3_MEDIA_UPLOAD_BUCKET:-langfuse}
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: ${LANGFUSE_S3_MEDIA_UPLOAD_REGION:-auto}
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: ${LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID:-minio}
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY:-miniosecret} # CHANGEME
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: ${LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT:-http://localhost:9090}
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: ${LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE:-true}
+      LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: ${LANGFUSE_S3_MEDIA_UPLOAD_PREFIX:-media/}
+      LANGFUSE_S3_BATCH_EXPORT_ENABLED: ${LANGFUSE_S3_BATCH_EXPORT_ENABLED:-false}
+      LANGFUSE_S3_BATCH_EXPORT_BUCKET: ${LANGFUSE_S3_BATCH_EXPORT_BUCKET:-langfuse}
+      LANGFUSE_S3_BATCH_EXPORT_PREFIX: ${LANGFUSE_S3_BATCH_EXPORT_PREFIX:-exports/}
+      LANGFUSE_S3_BATCH_EXPORT_REGION: ${LANGFUSE_S3_BATCH_EXPORT_REGION:-auto}
+      LANGFUSE_S3_BATCH_EXPORT_ENDPOINT: ${LANGFUSE_S3_BATCH_EXPORT_ENDPOINT:-http://minio:9000}
+      LANGFUSE_S3_BATCH_EXPORT_EXTERNAL_ENDPOINT: ${LANGFUSE_S3_BATCH_EXPORT_EXTERNAL_ENDPOINT:-http://localhost:9090}
+      LANGFUSE_S3_BATCH_EXPORT_ACCESS_KEY_ID: ${LANGFUSE_S3_BATCH_EXPORT_ACCESS_KEY_ID:-minio}
+      LANGFUSE_S3_BATCH_EXPORT_SECRET_ACCESS_KEY: ${LANGFUSE_S3_BATCH_EXPORT_SECRET_ACCESS_KEY:-miniosecret} # CHANGEME
+      LANGFUSE_S3_BATCH_EXPORT_FORCE_PATH_STYLE: ${LANGFUSE_S3_BATCH_EXPORT_FORCE_PATH_STYLE:-true}
+      LANGFUSE_INGESTION_QUEUE_DELAY_MS: ${LANGFUSE_INGESTION_QUEUE_DELAY_MS:-}
+      LANGFUSE_INGESTION_CLICKHOUSE_WRITE_INTERVAL_MS: ${LANGFUSE_INGESTION_CLICKHOUSE_WRITE_INTERVAL_MS:-}
+      REDIS_HOST: ${REDIS_HOST:-redis}
+      REDIS_PORT: ${REDIS_PORT:-6379}
+      REDIS_AUTH: ${REDIS_AUTH:-myredissecret} # CHANGEME
+      LANGFUSE_BULLMQ_SKIP_REDIS_VERSION_CHECK: ${LANGFUSE_BULLMQ_SKIP_REDIS_VERSION_CHECK:-false}
+      REDIS_TLS_ENABLED: ${REDIS_TLS_ENABLED:-false}
+      REDIS_TLS_CA: ${REDIS_TLS_CA:-/certs/ca.crt}
+      REDIS_TLS_CERT: ${REDIS_TLS_CERT:-/certs/redis.crt}
+      REDIS_TLS_KEY: ${REDIS_TLS_KEY:-/certs/redis.key}
+      EMAIL_FROM_ADDRESS: ${EMAIL_FROM_ADDRESS:-}
+      SMTP_CONNECTION_URL: ${SMTP_CONNECTION_URL:-}
 
-  clinical-clickhouse:
-    image: clickhouse/clickhouse-server:latest
-    container_name: clinical-clickhouse
+  langfuse-web:
+    image: docker.io/langfuse/langfuse:3
     restart: always
+    depends_on: *langfuse-depends-on
+    ports:
+      - 3000:3000
+    networks: [clinical-net]
     environment:
-      - CLICKHOUSE_USER=clickhouse
-      - CLICKHOUSE_PASSWORD=clickhouse
-      - CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1
-    expose: ["8123"]
-    networks: [clinical-net]
-    deploy: {resources: {limits: {memory: 512M}}}
-    healthcheck: {test: ["CMD", "wget", "--spider", "http://localhost:8123/ping"], interval: 5s, retries: 5}
+      <<: *langfuse-worker-env
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:-mysecret} # CHANGEME
+      LANGFUSE_INIT_ORG_ID: ${LANGFUSE_INIT_ORG_ID:-}
+      LANGFUSE_INIT_ORG_NAME: ${LANGFUSE_INIT_ORG_NAME:-}
+      LANGFUSE_INIT_PROJECT_ID: ${LANGFUSE_INIT_PROJECT_ID:-}
+      LANGFUSE_INIT_PROJECT_NAME: ${LANGFUSE_INIT_PROJECT_NAME:-}
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL:-}
+      LANGFUSE_INIT_USER_NAME: ${LANGFUSE_INIT_USER_NAME:-}
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:-}
 
-  clinical-redis:
-    image: redis:7-alpine
-    container_name: clinical-redis
+  clickhouse:
+    image: docker.io/clickhouse/clickhouse-server
     restart: always
-    command: --requirepass myredissecret
-    expose: ["6379"]
-    deploy: {resources: {limits: {memory: 256M}}}
-    networks: [clinical-net]
-
-  clinical-minio:
-    image: minio/minio:latest
-    container_name: clinical-minio
-    restart: always
-    command: server /data --console-address ":9001"
-    environment: [MINIO_ROOT_USER=minio, MINIO_ROOT_PASSWORD=miniosecret]
-    expose: ["9000"]
-    deploy: {resources: {limits: {memory: 512M}}}
-    networks: [clinical-net]
-
-  # NOTE: restored NEXTAUTH_SECRET / NEXTAUTH_URL / SALT and the MinIO S3
-  # upload variables below — these were present in earlier versions of this
-  # stack and are required by Langfuse v3 at startup. Their absence in the
-  # most recent compose file is exactly why clinical-langfuse-web was
-  # crash-looping ("Restarting (1)") in your last `docker ps` output.
-  clinical-langfuse-web:
-    image: langfuse/langfuse:3
-    container_name: clinical-langfuse-web
-    restart: always
-    ports: ["3000:3000"]
+    user: "101:101"
     environment:
-      - DATABASE_URL=postgresql://postgres:local_secure_password@langfuse-postgres:5432/langfuse
-      - CLICKHOUSE_URL=http://clinical-clickhouse:8123
-      - CLICKHOUSE_CLUSTER_ENABLED=false
-      - CLICKHOUSE_MIGRATION_URL=clickhouse://clinical-clickhouse:9000
-      - CLICKHOUSE_USER=clickhouse
-      - CLICKHOUSE_PASSWORD=clickhouse
-      - REDIS_HOST=clinical-redis
-      - REDIS_AUTH=myredissecret
-      - NEXTAUTH_URL=http://localhost:3000
-      - NEXTAUTH_SECRET=my_super_secret_key
-      - SALT=my_super_secure_salt
-      - LANGFUSE_S3_EVENT_UPLOAD_BUCKET=langfuse
-      - LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID=minio
-      - LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY=miniosecret
-      - LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT=http://clinical-minio:9000
-      - LANGFUSE_S3_MEDIA_UPLOAD_BUCKET=langfuse
-      - LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID=minio
-      - LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY=miniosecret
-      - LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT=http://clinical-minio:9000
-      # deploy.resources.limits below is a Swarm-only construct and is
-      # silently ignored by plain `docker compose up` — it was never
-      # actually capping this container's memory. The real fix for the
-      # "JavaScript heap out of memory" crash is controlling Node's heap
-      # directly via NODE_OPTIONS, independent of any Docker-level limit.
-      - NODE_OPTIONS=--max-old-space-size=1536
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse} # CHANGEME
+    volumes:
+      - langfuse_clickhouse_data:/var/lib/clickhouse
+      - langfuse_clickhouse_logs:/var/log/clickhouse-server
     networks: [clinical-net]
-    deploy: {resources: {limits: {memory: 2G}}}
-    depends_on:
-      langfuse-postgres: {condition: service_healthy}
-      clinical-clickhouse: {condition: service_healthy}
+    ports:
+      - 8123:8123
+      - 9000:9000
+    healthcheck:
+      test: wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 1s
+
+  minio:
+    image: cgr.dev/chainguard/minio
+    restart: always
+    entrypoint: sh
+    # create the 'langfuse' bucket before starting the service
+    command: -c 'mkdir -p /data/langfuse && minio server --address ":9000" --console-address ":9001" /data'
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-miniosecret} # CHANGEME
+    ports:
+      - 9090:9000
+      - 9091:9001
+    volumes:
+      - langfuse_minio_data:/data
+    networks: [clinical-net]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 1s
+      timeout: 5s
+      retries: 5
+      start_period: 1s
+
+  redis:
+    image: docker.io/redis:7
+    restart: always
+    # CHANGEME: row below to secure redis password
+    command: >
+      --requirepass ${REDIS_AUTH:-myredissecret}
+      --maxmemory-policy noeviction
+    ports:
+      - 6379:6379
+    volumes:
+      - langfuse_redis_data:/data
+    networks: [clinical-net]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 10s
+      retries: 10
+
+  postgres:
+    image: docker.io/postgres:${POSTGRES_VERSION:-17}
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    networks: [clinical-net]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres} # CHANGEME
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+      TZ: UTC
+      PGTZ: UTC
+    ports:
+      - 5433:5432
+    volumes:
+      - langfuse_postgres_data:/var/lib/postgresql/data

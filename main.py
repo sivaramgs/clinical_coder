@@ -31,7 +31,8 @@ CODER_AGENT_URL = os.getenv("CODER_AGENT_URL", "http://127.0.0.1:8004")
 langfuse = Langfuse(
     public_key=os.getenv("LANGFUSE_PUBLIC_KEY", "pk-lf-mock"),
     secret_key=os.getenv("LANGFUSE_SECRET_KEY", "sk-lf-mock"),
-    host=os.getenv("LANGFUSE_HOST", "http://clinical-langfuse-web:3000")
+    host=os.getenv("LANGFUSE_BASE_URL", "http://langfuse-web:3000"),
+    debug=True
 )
 
 # =========================================================================
@@ -42,10 +43,7 @@ inference_gateway = ClinicalInferenceGateway()
 llm_router = LLMGatewayRouter(gateway_instance=inference_gateway)
 
 # Long-lived Ray actor handle, created once in bootstrap() below — NOT
-# recreated per request. RayA2AAgentActor is now a lightweight httpx-only
-# actor (no sentence-transformers/torch), but keeping it as a persistent
-# singleton is still correct — no reason to pay actor-creation overhead on
-# every request.
+# recreated per request.
 shared_agent_actor = None
 
 # =========================================================================
@@ -115,7 +113,18 @@ async def process(payload: InputData):
             detail="Agent actor not yet initialized (Ray still starting up). Please retry shortly."
         )
 
-    trace = langfuse.trace(name="Clinical Processing Pipeline", input=payload.clinical_note)
+    # IMPORTANT FIX: trace creation is now wrapped in its own try/except,
+    # separate from the main pipeline logic. Previously, if langfuse.trace()
+    # itself failed (e.g. bad host/credentials), `trace` was never assigned
+    # — but the outer except block unconditionally called trace.update(...),
+    # raising UnboundLocalError and masking the real error entirely. Now a
+    # Langfuse failure degrades gracefully (trace=None) instead of crashing
+    # the whole request in a confusing way.
+    try:
+        trace = langfuse.trace(name="Clinical Processing Pipeline", input=payload.clinical_note)
+    except Exception as e:
+        print(f"[!] Langfuse trace creation failed (non-blocking): {type(e).__name__}: {e}")
+        trace = None
 
     try:
         # Phase 1: Ingestion & Extraction via Assistant Agent Node (MERaLiON)
@@ -162,15 +171,20 @@ async def process(payload: InputData):
             if LLMEvaluations.is_valid_icd10_format(c.strip())
         ]
 
-        trace.update(
-            output=final_text,
-            metadata={
-                "note_id": payload.note_id,
-                "engine_used": engine,
-                "validated_codes": validated_codes,
-                "candidate_count": len(candidates)
-            }
-        )
+        if trace is not None:
+            try:
+                trace.update(
+                    output=final_text,
+                    metadata={
+                        "note_id": payload.note_id,
+                        "engine_used": engine,
+                        "validated_codes": validated_codes,
+                        "candidate_count": len(candidates)
+                    }
+                )
+                langfuse.flush()
+            except Exception as flush_err:
+                print(f"[!] Langfuse trace update/flush failed (non-blocking): {flush_err}")
 
         return {
             "note_id": payload.note_id,
@@ -179,11 +193,16 @@ async def process(payload: InputData):
             "mapped_diagnostics": final_text,
             "validated_icd10_codes": validated_codes
         }
-
+        langfuse.flush()
     except HTTPException:
         raise
     except Exception as e:
-        trace.update(status_message=str(e), level="ERROR")
+        if trace is not None:
+            try:
+                trace.update(status_message=str(e), level="ERROR")
+                langfuse.flush()
+            except Exception as flush_err:
+                print(f"[!] Langfuse error-trace update/flush failed (non-blocking): {flush_err}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -203,7 +222,7 @@ def bootstrap():
         threading.Thread(target=start_daemon_server, args=(assistant_app, 8003), daemon=True).start()
         threading.Thread(target=start_daemon_server, args=(coder_app, 8004), daemon=True).start()
 
-    ray.init(ignore_reinit_error=True, object_store_memory=256 * 1024 * 1024)
+    ray.init(ignore_reinit_error=True, object_store_memory=256 * 1024 * 1024, include_dashboard=False)
 
     shared_agent_actor = RayA2AAgentActor.remote()
     print("[*] Persistent RayA2AAgentActor created.")
