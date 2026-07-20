@@ -17,6 +17,21 @@ An enterprise-grade, privacy-preserving, local-first architecture designed for s
 ![requestflow](./RequestFlow.png)
 
 
+## Tech Stack
+
+- Python 3.12+
+- FastAPI
+- Langfuse
+- Ray
+- Ollama
+- Qdrant
+- Clickhouse
+- Redis
+- A2A
+- MCP 
+- Render Cloud
+- nginx
+
 ## 📂 Detailed File Catalog
 
 | File / Module Path | Architecture Role | Technical Responsibility & Behavior |
@@ -81,3 +96,6 @@ LANGFUSE_BASE_URL="http://langfuse-web:3000"
 ```terminal
 docker compose up -d # This will restart only the required containers.
 ```
+
+## End to End Demo
+![Demo](project_execution.gif)
