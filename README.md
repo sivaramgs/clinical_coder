@@ -32,7 +32,6 @@ An enterprise-grade, privacy-preserving, local-first architecture designed for s
 - Redis
 - A2A
 - MCP 
-- Render Cloud
 - nginx
 
 ## 📂 Detailed File Catalog
