@@ -20,6 +20,9 @@ An enterprise-grade, privacy-preserving, local-first architecture designed for s
 ## Tech Stack
 
 - Python 3.12+
+- Sea-Lion 8B
+- MERaLiON-8B
+- Nomic Text Model
 - FastAPI
 - Langfuse
 - Ray
@@ -98,4 +101,4 @@ docker compose up -d # This will restart only the required containers.
 ```
 
 ## End to End Demo
-![Demo](project_execution.gif)
+![Demo](project_demo.gif)
